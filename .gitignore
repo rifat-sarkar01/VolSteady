@@ -9,3 +9,4 @@ dist/
 *.egg-info/
 .env
 *.log
+implementation_plan.md
