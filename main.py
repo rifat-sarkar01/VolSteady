@@ -128,11 +128,6 @@ class VolSteadyApp:
         if self.engine:
             self.engine.stop()  # Restores original Windows volume
 
-        # Wait for playback thread to drain (if it exists)
-        if (self.engine and self.engine._playback_thread
-                and self.engine._playback_thread.is_alive()):
-            self.engine._playback_thread.join(timeout=2.0)
-
         release_single_instance_lock()
         self._shutdown_event.set()
 

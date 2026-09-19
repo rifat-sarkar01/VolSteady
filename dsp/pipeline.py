@@ -17,17 +17,17 @@ from .level_detector import linear_to_db
 def strength_to_params(strength: float) -> dict:
     """
     Map a 0–100 strength value to compressor parameters.
-    strength=0  → bypass (ratio 1:1, threshold 0 dB)
-    strength=50 → moderate (ratio 4:1, threshold -25 dB)
+    strength=0   → bypass (ratio 1:1, threshold 0 dB — no compression)
+    strength=50  → moderate (ratio 4.5:1, threshold -25 dB)
     strength=100 → aggressive (ratio 10:1, threshold -40 dB)
     """
     t = strength / 100.0
     return {
-        "threshold_db": -10.0 - 30.0 * t,       # 0 → -10 dB,  100 → -40 dB
-        "ratio": 1.0 + 9.0 * t,                  # 0 → 1:1,     100 → 10:1
-        "attack_ms": 30.0 - 25.0 * t,            # 0 → 30 ms,   100 → 5 ms
-        "release_ms": 400.0 - 200.0 * t,         # 0 → 400 ms,  100 → 200 ms
-        "makeup_gain_db": 6.0 * t,               # 0 → 0 dB,    100 → +6 dB
+        "threshold_db": 0.0 - 40.0 * t,          # 0 →  0 dB,   100 → -40 dB
+        "ratio": 1.0 + 9.0 * t,                   # 0 → 1:1,     100 → 10:1
+        "attack_ms": 30.0 - 25.0 * t,             # 0 → 30 ms,   100 → 5 ms
+        "release_ms": 400.0 - 200.0 * t,          # 0 → 400 ms,  100 → 200 ms
+        "makeup_gain_db": 8.0 * t,                # 0 → 0 dB,    100 → +8 dB
     }
 
 
@@ -163,6 +163,47 @@ class DSPPipeline:
         self.gain_reduction_db = self.compressor.current_gr_db + self.limiter.current_gr_db
 
         return audio
+
+    def set_sample_rate(self, sample_rate: int):
+        """
+        Update the sample rate for all DSP components, re-initializing
+        their internal time constants (attack/release coefficients).
+        Must be called after discovering the actual device sample rate.
+        """
+        if sample_rate == self.sample_rate:
+            return
+
+        self.sample_rate = sample_rate
+
+        # Re-create the gate with new sample rate
+        self.gate = NoiseGate(
+            threshold_db=-50.0,
+            attack_ms=0.5,
+            release_ms=50.0,
+            hold_ms=20.0,
+            sample_rate=sample_rate,
+        )
+
+        # Re-create the compressor with new sample rate,
+        # preserving current parameter settings
+        old_comp = self.compressor
+        self.compressor = DynamicCompressor(
+            threshold_db=old_comp.threshold_db,
+            ratio=old_comp.ratio,
+            attack_ms=10.0,
+            release_ms=200.0,
+            knee_db=old_comp.knee_db,
+            makeup_gain_db=old_comp.makeup_gain_db,
+            sample_rate=sample_rate,
+        )
+
+        # Re-create the limiter with new sample rate
+        self.limiter = BrickWallLimiter(
+            ceiling_db=self.limiter.ceiling_db,
+            release_ms=50.0,
+            lookahead_ms=5.0,
+            sample_rate=sample_rate,
+        )
 
     def reset(self):
         self.gate.reset()
