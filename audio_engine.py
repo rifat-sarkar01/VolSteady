@@ -37,12 +37,15 @@ CHANNELS = 2
 SAMPLE_RATE = 48000
 
 # Volume-rider parameters
-VOLUME_UPDATE_INTERVAL_S = 0.030   # Update volume every ~30 ms
+VOLUME_UPDATE_INTERVAL_S = 0.010   # Update volume every ~10 ms (was 30 ms — perceptible lag)
 TARGET_LOUDNESS_DB = -18.0         # Target RMS loudness in dBFS
 MAX_GAIN_DB = 12.0                 # Maximum boost (dB)
 MIN_GAIN_DB = -24.0                # Maximum cut (dB)
-SMOOTHING_ATTACK = 0.15            # Fast response to loud signals (0–1, lower = faster)
-SMOOTHING_RELEASE = 0.985          # Slow recovery after loud signals
+SMOOTHING_ATTACK = 0.05            # Fast response to loud signals (was 0.15 — too slow)
+SMOOTHING_RELEASE = 0.92           # Smooth recovery after loud signals (was 0.985 — ~2 s lag)
+
+# Tolerance for detecting user-initiated volume changes vs. our own writes
+VOLUME_CHANGE_EPSILON = 0.015
 
 
 class AudioEngine:
@@ -69,6 +72,7 @@ class AudioEngine:
         self._original_volume = None
         self._volume_interface = None
         self._user_volume = 1.0       # Volume scalar the user had before we started
+        self._last_written_volume = None  # Track what we last wrote to detect user changes
 
         # Envelope-rider state
         self._current_rms_db = -60.0   # Current measured RMS level
@@ -336,6 +340,15 @@ class AudioEngine:
 
     # ─── Volume rider ────────────────────────────────────────
 
+    def _read_current_volume(self) -> float | None:
+        """Read the current Windows endpoint volume. Returns None on failure."""
+        if self._volume_interface is None:
+            return None
+        try:
+            return float(self._volume_interface.GetMasterVolumeLevelScalar())
+        except Exception:
+            return None
+
     def _volume_rider_loop(self):
         """
         Runs in a daemon thread. Periodically reads the measured RMS level
@@ -343,16 +356,32 @@ class AudioEngine:
         target level.
 
         The algorithm:
-          1. Compute error = TARGET_LOUDNESS_DB - current_rms_db
-          2. Convert error to a gain scalar
-          3. Smooth the gain with asymmetric attack/release
-          4. Multiply by user's original volume to get final endpoint volume
-          5. Write to Windows via pycaw
+          1. Detect if the user changed volume externally → adopt new baseline
+          2. Compute error = TARGET_LOUDNESS_DB - current_rms_db
+          3. Convert error to a gain scalar
+          4. Smooth the gain with asymmetric attack/release
+          5. Multiply by user's baseline volume to get final endpoint volume
+          6. Write to Windows via pycaw
         """
         logger.info("Volume rider thread started.")
 
         while self._running:
             try:
+                # ── Detect user volume changes ─────────────────────────
+                # If the current system volume differs from what we last
+                # wrote, the user must have changed it (keyboard, mixer).
+                # Adopt their new volume as our baseline.
+                current_sys_vol = self._read_current_volume()
+                if (current_sys_vol is not None
+                        and self._last_written_volume is not None):
+                    delta = abs(current_sys_vol - self._last_written_volume)
+                    if delta > VOLUME_CHANGE_EPSILON:
+                        logger.debug(
+                            f"User volume change detected: "
+                            f"{self._last_written_volume:.3f} → {current_sys_vol:.3f}"
+                        )
+                        self._user_volume = current_sys_vol
+
                 with self._level_lock:
                     rms_db = self._current_rms_db
                     prev_gain = self._smooth_gain
@@ -384,8 +413,9 @@ class AudioEngine:
                 final_volume = self._user_volume * smooth_gain
                 final_volume = max(0.0, min(1.0, final_volume))
 
-                # Apply to Windows
+                # Apply to Windows and track what we wrote
                 self._set_endpoint_volume(final_volume)
+                self._last_written_volume = final_volume
 
                 with self._level_lock:
                     self._smooth_gain = smooth_gain

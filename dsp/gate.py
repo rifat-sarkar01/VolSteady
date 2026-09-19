@@ -52,6 +52,46 @@ def _apply_gate(
     return out, gain, hold_remain
 
 
+@nb.jit(nopython=True, cache=True)
+def _compute_gate_gain(
+    envelope: np.ndarray,
+    threshold_linear: float,
+    gain_state: float,
+    hold_samples_remaining: int,
+    hold_samples_total: int,
+    open_coeff: float,
+    close_coeff: float,
+) -> tuple:
+    """
+    Compute per-sample gate gain envelope (without multiplying into audio).
+    Returns (gain_envelope, final_gain_state, hold_samples_remaining).
+    Used for linked-stereo gating where the same gain applies to all channels.
+    """
+    n = len(envelope)
+    gain_env = np.empty(n, dtype=np.float32)
+    gain = gain_state
+    hold_remain = hold_samples_remaining
+
+    for i in range(n):
+        if envelope[i] >= threshold_linear:
+            hold_remain = hold_samples_total
+            target = 1.0
+        elif hold_remain > 0:
+            hold_remain -= 1
+            target = 1.0
+        else:
+            target = 0.0
+
+        if target > gain:
+            gain = open_coeff * gain + (1.0 - open_coeff) * target
+        else:
+            gain = close_coeff * gain + (1.0 - close_coeff) * target
+
+        gain_env[i] = gain
+
+    return gain_env, gain, hold_remain
+
+
 class NoiseGate:
     """
     Noise gate with configurable threshold, attack, release, and hold.
@@ -95,6 +135,9 @@ class NoiseGate:
         """
         Process audio buffer (shape: [samples, channels] or [samples]).
         Returns processed audio of the same shape.
+
+        Uses linked-stereo detection: the louder channel's envelope drives
+        the gate for both channels, preserving the stereo image.
         """
         if not self._enabled:
             return audio
@@ -104,25 +147,40 @@ class NoiseGate:
             audio = audio[:, np.newaxis]
 
         n_channels = audio.shape[1]
+        active_channels = min(n_channels, 2)
         out = np.empty_like(audio)
 
-        for ch in range(min(n_channels, 2)):
+        # --- Linked stereo: detect envelopes on all active channels ---
+        envelopes = []
+        for ch in range(active_channels):
             samples = audio[:, ch].astype(np.float32)
             envelope = self._detectors[ch].process(samples)
+            envelopes.append(envelope)
 
-            gated, gain, hold = _apply_gate(
-                samples,
-                envelope,
-                self._threshold_linear,
-                self._gain_state[ch],
-                self._hold_remain[ch],
-                self._hold_samples,
-                self._open_coeff,
-                self._close_coeff,
-            )
-            self._gain_state[ch] = gain
-            self._hold_remain[ch] = hold
-            out[:, ch] = gated
+        # Take the max envelope across channels (linked stereo sidechain)
+        if active_channels == 2:
+            linked_envelope = np.maximum(envelopes[0], envelopes[1])
+        else:
+            linked_envelope = envelopes[0]
+
+        # Compute a single gate gain envelope from the linked sidechain
+        gate_gain, gain, hold = _compute_gate_gain(
+            linked_envelope,
+            self._threshold_linear,
+            self._gain_state[0],
+            self._hold_remain[0],
+            self._hold_samples,
+            self._open_coeff,
+            self._close_coeff,
+        )
+        self._gain_state[0] = gain
+        self._gain_state[1] = gain
+        self._hold_remain[0] = hold
+        self._hold_remain[1] = hold
+
+        # Apply the same gate gain to all active channels
+        for ch in range(active_channels):
+            out[:, ch] = audio[:, ch].astype(np.float32) * gate_gain
 
         if n_channels > 2:
             out[:, 2:] = audio[:, 2:]

@@ -111,6 +111,9 @@ class DynamicCompressor:
         """
         Process audio buffer (shape: [samples, channels] or [samples]).
         Returns compressed audio of the same shape.
+
+        Uses linked-stereo detection: the louder channel's envelope drives
+        gain reduction for both channels, preserving the stereo image.
         """
         if not self._enabled:
             return audio
@@ -120,34 +123,42 @@ class DynamicCompressor:
             audio = audio[:, np.newaxis]
 
         n_channels = audio.shape[1]
+        active_channels = min(n_channels, 2)
         out = np.empty_like(audio)
-        total_gr = 0.0
 
-        for ch in range(min(n_channels, 2)):
+        # --- Linked stereo: detect envelopes on all active channels ---
+        envelopes_db = []
+        for ch in range(active_channels):
             samples = audio[:, ch].astype(np.float32)
-
-            # Detect level
             envelope_linear = self._detectors[ch].process(samples)
-            envelope_db = linear_to_db(envelope_linear).astype(np.float32)
+            envelopes_db.append(linear_to_db(envelope_linear).astype(np.float32))
 
-            # Compute gain reduction
-            gr_db, self._gr_state[ch] = _compute_gain_reduction(
-                envelope_db,
-                float(self.threshold_db),
-                float(self.ratio),
-                float(self.knee_db),
-                self._gr_state[ch],
-                self._attack_coeff,
-                self._release_coeff,
-            )
+        # Take the max envelope across channels (linked stereo sidechain)
+        if active_channels == 2:
+            linked_envelope_db = np.maximum(envelopes_db[0], envelopes_db[1])
+        else:
+            linked_envelope_db = envelopes_db[0]
 
-            # Apply gain reduction + makeup gain
-            gain_linear = np.power(10.0, (-gr_db + self.makeup_gain_db) / 20.0).astype(np.float32)
-            out[:, ch] = samples * gain_linear
-            total_gr += float(np.mean(gr_db))
+        # Compute a single gain-reduction curve from the linked envelope
+        gr_db, self._gr_state[0] = _compute_gain_reduction(
+            linked_envelope_db,
+            float(self.threshold_db),
+            float(self.ratio),
+            float(self.knee_db),
+            self._gr_state[0],
+            self._attack_coeff,
+            self._release_coeff,
+        )
+        # Keep both channel states in sync
+        self._gr_state[1] = self._gr_state[0]
+
+        # Apply the same gain reduction to all active channels
+        gain_linear = np.power(10.0, (-gr_db + self.makeup_gain_db) / 20.0).astype(np.float32)
+        for ch in range(active_channels):
+            out[:, ch] = audio[:, ch].astype(np.float32) * gain_linear
 
         # Update meter value
-        self.current_gr_db = total_gr / min(n_channels, 2)
+        self.current_gr_db = float(np.mean(gr_db))
 
         if n_channels > 2:
             out[:, 2:] = audio[:, 2:]

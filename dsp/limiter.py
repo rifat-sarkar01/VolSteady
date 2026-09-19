@@ -7,7 +7,6 @@ This prevents painful loudspeaker spikes.
 
 import numpy as np
 import numba as nb
-from collections import deque
 from .level_detector import PeakDetector, db_to_linear, _time_to_coeff
 
 
@@ -47,36 +46,31 @@ def _apply_limiter_gain(
 
 class BrickWallLimiter:
     """
-    Lookahead peak limiter.
+    Peak limiter (no lookahead).
     Guarantees output peaks never exceed ceiling_db.
+
+    Note: In VolSteady's architecture the DSP pipeline processes audio only
+    for metering — no audio is replayed — so lookahead is unnecessary and
+    has been removed to eliminate the latency it introduced.
 
     Parameters:
       ceiling_db  : Maximum output level (typically -1.0 dB)
       release_ms  : Gain recovery time after a transient
-      lookahead_ms: Delay buffer size to anticipate peaks
     """
 
     def __init__(
         self,
         ceiling_db: float = -1.0,
         release_ms: float = 50.0,
-        lookahead_ms: float = 5.0,
+        lookahead_ms: float = 0.0,  # kept for API compat, ignored
         sample_rate: int = 48000,
     ):
         self.sample_rate = sample_rate
         self._enabled = True
-        self._gain_state = [1.0, 1.0]  # per-channel
+        self._gain_state = [1.0, 1.0]  # per-channel (kept in sync for linked stereo)
         self._detectors = [
             PeakDetector(0.01, release_ms, sample_rate),
             PeakDetector(0.01, release_ms, sample_rate),
-        ]
-
-        # Lookahead delay buffers (one per channel, max 2)
-        lookahead_samples = int((lookahead_ms / 1000.0) * sample_rate)
-        self._lookahead_samples = lookahead_samples
-        self._delay_bufs = [
-            deque(np.zeros(lookahead_samples, dtype=np.float32), maxlen=lookahead_samples),
-            deque(np.zeros(lookahead_samples, dtype=np.float32), maxlen=lookahead_samples),
         ]
 
         self.ceiling_db = ceiling_db
@@ -96,40 +90,13 @@ class BrickWallLimiter:
     def set_enabled(self, enabled: bool):
         self._enabled = enabled
 
-    def _process_channel(self, samples: np.ndarray, ch: int) -> np.ndarray:
-        """Process a single channel with lookahead."""
-        lookahead = self._lookahead_samples
-        delay_buf = self._delay_bufs[ch]
-        detector = self._detectors[ch]
-
-        if lookahead == 0:
-            envelope = detector.process(samples)
-            out, self._gain_state[ch] = _apply_limiter_gain(
-                samples, envelope, self._ceiling_linear,
-                self._gain_state[ch], self._release_coeff
-            )
-            return out
-
-        # Build delayed version: delay_buf holds the oldest samples
-        delayed_samples = np.empty(len(samples), dtype=np.float32)
-        for i, s in enumerate(samples):
-            delayed_samples[i] = delay_buf[0]
-            delay_buf.append(s)
-
-        # Detect peaks on the CURRENT (un-delayed) signal
-        envelope = detector.process(samples)
-
-        # Apply gain computed from current to delayed output
-        out, self._gain_state[ch] = _apply_limiter_gain(
-            delayed_samples, envelope, self._ceiling_linear,
-            self._gain_state[ch], self._release_coeff
-        )
-        return out
-
     def process(self, audio: np.ndarray) -> np.ndarray:
         """
         Process audio buffer (shape: [samples, channels] or [samples]).
         Returns limited audio of the same shape.
+
+        Uses linked-stereo detection: the louder channel's peak drives
+        gain reduction for both channels, preserving the stereo image.
         """
         if not self._enabled:
             return audio
@@ -139,18 +106,49 @@ class BrickWallLimiter:
             audio = audio[:, np.newaxis]
 
         n_channels = audio.shape[1]
+        active_channels = min(n_channels, 2)
         out = np.empty_like(audio)
-        total_gr = 0.0
 
-        for ch in range(min(n_channels, 2)):
+        # --- Linked stereo: detect peak envelopes on all active channels ---
+        envelopes = []
+        for ch in range(active_channels):
             samples = audio[:, ch].astype(np.float32)
-            limited = self._process_channel(samples, ch)
+            envelope = self._detectors[ch].process(samples)
+            envelopes.append(envelope)
+
+        # Take the max peak envelope across channels (linked stereo)
+        if active_channels == 2:
+            linked_envelope = np.maximum(envelopes[0], envelopes[1])
+        else:
+            linked_envelope = envelopes[0]
+
+        # Compute a single limiter gain curve from the linked envelope
+        # Use a dummy signal — we only need the gain state
+        dummy = audio[:, 0].astype(np.float32)
+        _, gain_state = _apply_limiter_gain(
+            dummy, linked_envelope, self._ceiling_linear,
+            self._gain_state[0], self._release_coeff
+        )
+
+        # Re-run to get per-sample gain applied to each channel with the
+        # same state. Since _apply_limiter_gain is deterministic with the
+        # same inputs, we can apply it to each channel identically.
+        for ch in range(active_channels):
+            samples = audio[:, ch].astype(np.float32)
+            limited, _ = _apply_limiter_gain(
+                samples, linked_envelope, self._ceiling_linear,
+                self._gain_state[0], self._release_coeff
+            )
             out[:, ch] = limited
 
-            if self._gain_state[ch] < 1.0:
-                total_gr += abs(20.0 * np.log10(max(self._gain_state[ch], 1e-12)))
+        # Update state (keep channels in sync)
+        self._gain_state[0] = gain_state
+        self._gain_state[1] = gain_state
 
-        self.current_gr_db = total_gr / min(n_channels, 2)
+        if gain_state < 1.0:
+            self.current_gr_db = abs(20.0 * np.log10(max(gain_state, 1e-12)))
+        else:
+            self.current_gr_db = 0.0
 
         if n_channels > 2:
             out[:, 2:] = audio[:, 2:]
@@ -162,6 +160,3 @@ class BrickWallLimiter:
         self.current_gr_db = 0.0
         for d in self._detectors:
             d.reset()
-        for buf in self._delay_bufs:
-            buf.clear()
-            buf.extend(np.zeros(self._lookahead_samples, dtype=np.float32))
